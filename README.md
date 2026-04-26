@@ -53,13 +53,15 @@ PiKVM v3+ uses a Raspberry Pi Pico as a USB HID gadget, connected to the host Pi
 
 Composite HID device, VID `0x1209` / PID `0xEDA2` (`PiKVM` / `PiKVM HID`).
 
-| Interface | Class | Notes |
-|---|---|---|
-| 0 | HID — boot keyboard | 8-bit modifier byte + 6-key rollover |
-| 1 | HID — absolute mouse | 0..32767 X/Y range, scroll wheel, 3 buttons |
-| 2 | HID — boot relative mouse | Standard relative mouse, 3 buttons |
+Single HID interface with Report IDs (via ESP32 Arduino USB framework):
 
-Identical to the [pico-hid-usb composite descriptor](https://github.com/pikvm/kvmd/tree/master/hid/pico).
+| Report ID | Class | Notes |
+|---|---|---|
+| 1 | Keyboard | 8-bit modifier + 6-key rollover (Arduino USBHIDKeyboard) |
+| 2 | Relative mouse | Standard dx/dy/wheel (Arduino USBHIDMouse) |
+| 3 | Absolute mouse | 0..32767 X/Y, scroll wheel, 8 buttons (custom USBHIDDevice) |
+
+Uses the ESP32 Arduino USBHID framework for proper SET_CONFIGURATION handling. Raw TinyUSB descriptor overrides do not work on ESP32-S3 Arduino because ESP-IDF's TinyUSB wrapper does not register class drivers for custom descriptors.
 
 ## Build & flash
 
@@ -69,8 +71,12 @@ Requires [PlatformIO Core](https://platformio.org/install/cli):
 git clone https://github.com/schwarztim/pikvm-esp32-hid.git
 cd pikvm-esp32-hid
 pio run                                        # build
-pio run --target upload                        # flash via "UART" port (USB-Serial-JTAG)
+pio run --target upload                        # flash via CH343 "UART" port
 ```
+
+### Optional: WiFi debug
+
+Copy `src/config.h.example` to `src/config.h` and fill in your WiFi credentials. When `config.h` is present, the firmware connects to WiFi and serves a JSON status page on port 80. When absent, WiFi is compiled out entirely.
 
 After flash, plug the **"USB" port** into a host PC. The host should see:
 
