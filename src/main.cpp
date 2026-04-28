@@ -23,6 +23,7 @@
 #if __has_include("config.h")
 #  include "config.h"
 #  include <WiFi.h>
+#  include <ArduinoOTA.h>
 #  define HAVE_WIFI 1
 #else
 #  define HAVE_WIFI 0
@@ -48,6 +49,7 @@
 #define CMD_MOUSE_BUTTON    0x13
 #define CMD_MOUSE_WHEEL     0x14
 #define CMD_MOUSE_REL       0x15
+#define CMD_HUMANIZE        0x20
 
 #define RESP_NONE           0x24
 #define RESP_CRC_ERROR      0x40
@@ -142,6 +144,7 @@ static uint8_t active_mouse_mode = OUT1_MOUSE_USB_ABS;
 static uint8_t kbd_mods = 0, kbd_keys[6] = {0}, kbd_leds = 0;
 static uint8_t mouse_buttons = 0;
 static int16_t mouse_abs_x = 0, mouse_abs_y = 0;
+static bool humanize_enabled = false;
 static uint8_t prev_resp_code = RESP_NONE;
 static bool reset_required = false;
 static unsigned long reset_scheduled_at = 0;
@@ -173,6 +176,7 @@ static uint16_t crc16_modbus(const uint8_t *buf, size_t len) {
 // ---- USB HID send functions ----
 static void send_kbd_report() {
     if (!tud_mounted()) return;
+    if (humanize_enabled) delayMicroseconds(esp_random() % 3000);
     KeyReport report;
     report.modifiers = kbd_mods;
     report.reserved = 0;
@@ -182,6 +186,7 @@ static void send_kbd_report() {
 
 static void send_abs_mouse_report(int8_t wheel) {
     if (!tud_mounted()) return;
+    if (humanize_enabled) delayMicroseconds(esp_random() % 3000);
     uint16_t x = (uint16_t)(((int32_t)mouse_abs_x + 32768) / 2);
     uint16_t y = (uint16_t)(((int32_t)mouse_abs_y + 32768) / 2);
     AbsMouseDev.send(mouse_buttons, x, y, wheel);
@@ -189,6 +194,7 @@ static void send_abs_mouse_report(int8_t wheel) {
 
 static void send_rel_mouse_report(int8_t dx, int8_t dy, int8_t wheel) {
     if (!tud_mounted()) return;
+    if (humanize_enabled) delayMicroseconds(esp_random() % 3000);
     RelMouse.move(dx, dy, wheel);
 }
 
@@ -225,8 +231,8 @@ static void handle_mouse_button(uint8_t m, uint8_t e) {
     else if ((active_mouse_mode & OUT1_MOUSE_MASK) == OUT1_MOUSE_USB_REL) send_rel_mouse_report(0, 0, 0);
 }
 
-static void load_output_modes() { prefs.begin("pikvm", true); active_kbd_mode = prefs.getUChar("kbd_mode", OUT1_KBD_USB); active_mouse_mode = prefs.getUChar("mouse_mode", OUT1_MOUSE_USB_ABS); prefs.end(); }
-static void save_output_modes() { prefs.begin("pikvm", false); prefs.putUChar("kbd_mode", active_kbd_mode); prefs.putUChar("mouse_mode", active_mouse_mode); prefs.end(); }
+static void load_output_modes() { prefs.begin("pikvm", true); active_kbd_mode = prefs.getUChar("kbd_mode", OUT1_KBD_USB); active_mouse_mode = prefs.getUChar("mouse_mode", OUT1_MOUSE_USB_ABS); humanize_enabled = prefs.getBool("humanize", false); prefs.end(); }
+static void save_output_modes() { prefs.begin("pikvm", false); prefs.putUChar("kbd_mode", active_kbd_mode); prefs.putUChar("mouse_mode", active_mouse_mode); prefs.putBool("humanize", humanize_enabled); prefs.end(); }
 
 // ---- Protocol Response ----
 static void send_response(uint8_t code) {
@@ -279,6 +285,11 @@ static void handle_packet(const uint8_t *data) {
         case CMD_MOUSE_REL:
             if ((active_mouse_mode & OUT1_MOUSE_MASK) == OUT1_MOUSE_USB_REL) send_rel_mouse_report((int8_t)args[0], (int8_t)args[1], 0);
             send_response(PONG_OK); break;
+        case CMD_HUMANIZE:
+            humanize_enabled = (args[0] != 0);
+            save_output_modes();
+            Serial.printf("[humanize] %s\n", humanize_enabled ? "ON" : "OFF");
+            send_response(PONG_OK); break;
         default: send_response(RESP_INVALID_ERROR); break;
     }
 }
@@ -294,10 +305,16 @@ void setup() {
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     load_output_modes();
 
-    USB.VID(0x1209);
-    USB.PID(0xEDA2);
-    USB.manufacturerName("PiKVM");
-    USB.productName("PiKVM HID");
+    // Logitech USB Keyboard identity — macOS has a native profile for this
+    // VID/PID, so the Keyboard Setup Assistant dialog does not fire.
+    // For the conference demo this also makes the device fingerprint match
+    // a real Logitech keyboard rather than advertising itself as PiKVM.
+    // The mirror-device feature (see .planning/seeds) will make this
+    // runtime-configurable via voice once the NVS descriptor system lands.
+    USB.VID(0x046d);
+    USB.PID(0xc31c);
+    USB.manufacturerName("Logitech");
+    USB.productName("USB Keyboard");
     USB.serialNumber(serial_str);
     Keyboard.begin();
     AbsMouseDev.begin();
@@ -314,6 +331,15 @@ void setup() {
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.println("[pikvm-hid] wifi connecting...");
+    // OTA: once WiFi comes up, ArduinoOTA.begin() is called in loop().
+    // Push firmware from Pi: pio run -e esp32s3_ota -t upload
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+#  ifdef OTA_PASSWORD
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+#  endif
+    ArduinoOTA.onStart([]() { Serial.println("[ota] starting"); });
+    ArduinoOTA.onEnd([]()   { Serial.println("[ota] done — rebooting"); });
+    ArduinoOTA.onError([](ota_error_t e) { Serial.printf("[ota] error %u\n", e); });
 #endif
 }
 
@@ -337,10 +363,12 @@ void loop() {
     }
 
 #if HAVE_WIFI
+    ArduinoOTA.handle();
     if (WiFi.status() == WL_CONNECTED) {
         if (!wifi_was_connected) {
             wifi_was_connected = true;
             tcp_server.begin();
+            ArduinoOTA.begin();
             Serial.printf("[pikvm-hid] wifi up ip=%s\n", WiFi.localIP().toString().c_str());
         }
         WiFiClient client = tcp_server.available();
